@@ -1,296 +1,265 @@
 import os
-import json
+import re
 import time
-import random
-import itertools
-from typing import Optional, List, Dict
+import subprocess
+import pyautogui
+import pyperclip
+import pandas as pd
+from playwright.sync_api import sync_playwright
 
-import tkinter as tk
-from tkinter import simpledialog
+# SETTINGS
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.6
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+DOORDASH_URL = "https://www.doordash.com/"
+CHROME_PROFILE = r"C:\Users\Dhruvi\AppData\Local\Google\Chrome\User Data"
+CHROME_PROFILE_NAME = "Default"  # change if you use Profile 1, etc.
+OUTPUT_FILE = "flowers_div_links.xlsx"
 
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+# HELPERS
 
-# CONFIG
-TARGET_URL = "https://www.doordash.com/home"
+def wait(sec): time.sleep(sec)
 
-# PROXIES = ["http://user:pass@1.2.3.4:8000", "http://5.6.7.8:8080"]
-# Leave empty to run without proxy rotation.
-PROXIES: List[Optional[str]] = [
-    # "http://username:password@proxy1.example.com:8000",
-    # "http://proxy2.example.com:8080",
-]
+def type_text_clipboard(text):
+    pyperclip.copy(text)
+    pyautogui.hotkey("ctrl", "v")
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
-]
-
-COOKIES_FILE = "cookies.json"
-HTML_DUMP = "scraped_page.html"
-NAV_TIMEOUT_MS = 45000
-
-# Utilities: cookies
-def save_cookies(cookies: List[Dict], filename: str = COOKIES_FILE):
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(cookies, f, indent=2)
-        print(f" Saved {len(cookies)} cookies to {filename}")
-    except Exception as e:
-        print(f" Could not save cookies: {e}")
-
-def load_cookies(filename: str = COOKIES_FILE) -> Optional[List[Dict]]:
-    if not os.path.exists(filename):
-        return None
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            cookies = json.load(f)
-        print(f" Loaded {len(cookies)} cookies from {filename}")
-        return cookies
-    except Exception as e:
-        print(f" Could not load cookies: {e}")
-        return None
-
-# -----------------------------
-# Small GUI to accept address (optional)
-# -----------------------------
-def ask_user_for_address(prompt: str = "Please update the address for search (optional):") -> Optional[str]:
-    root = tk.Tk()
-    root.withdraw()
-    val = simpledialog.askstring(title="Address (optional)", prompt=prompt)
-    root.destroy()
-    return val
-
-# Human verification detection heuristics
-def detect_human_verification(page) -> bool:
-    """
-    Return True if common captcha/verification elements are detected.
-    Heuristics: scan for iframes with recaptcha/hcaptcha, elements/classes containing 'captcha' or 'turnstile',
-    or clear textual prompts like 'verify you are human'.
-    """
-    try:
-        # Check for iframes that often host captchas
-        iframe_selectors = [
-            'iframe[src*="recaptcha"]',
-            'iframe[src*="hcaptcha"]',
-            'iframe[src*="turnstile"]',
-            'iframe[src*="captcha"]',
-        ]
-        for sel in iframe_selectors:
-            el = page.query_selector(sel)
-            if el:
-                print(f" Detected captcha iframe by selector {sel}")
-                return True
-
-        # Generic checks for elements that include 'captcha' or 'turnstile' in class or id
-        generic_selectors = [
-            '[class*="captcha"]',
-            '[id*="captcha"]',
-            '[class*="turnstile"]',
-            '[id*="turnstile"]',
-            '[class*="h-captcha"]',
-            '[id*="h-captcha"]',
-        ]
-        for sel in generic_selectors:
-            el = page.query_selector(sel)
-            if el:
-                print(f" Detected captcha element by selector {sel}")
-                return True
-
-        # Look for textual prompts
-        body_text = page.inner_text("body", timeout=2000).lower() if page.query_selector("body") else ""
-        heuristics = ["verify you are human", "please verify", "are you human", "complete the security check", "please complete the security check"]
-        for phrase in heuristics:
-            if phrase in body_text:
-                print(f" Detected verification text: '{phrase}'")
-                return True
-
-        # No obvious verification found
-        return False
-    except Exception as e:
-        print(f" Error during verification detection: {e}")
-        # Be conservative: if detection throws, assume possible verification
-        return True
-
-# Simple parse and save
-
-def parse_and_save_html(html: str, filename: str = HTML_DUMP):
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(html)
-        print(f" Saved HTML to {filename}")
-    except Exception as e:
-        print(f" Failed to save HTML: {e}")
-
-    # Example parse (title + snippet)
-    soup = BeautifulSoup(html, "html.parser")
-    title = soup.title.string.strip() if soup.title and soup.title.string else "No title"
-    snippet = soup.get_text(separator=" ", strip=True)[:800]
-    print(f" Page title: {title}")
-    print(f" Snippet (first 300 chars):\n{snippet[:300]}")
-
-
-# Core: launch visible browser with proxy + optional cookies
-
-def run_one_session(url: str,
-                    proxy: Optional[str],
-                    user_agent: str,
-                    cookies_to_restore: Optional[List[Dict]],
-                    allow_manual_solve: bool = True) -> Optional[str]:
-    """
-    Launch visible Chromium with provided proxy and cookies, navigate, detect verification.
-    If verification found and allow_manual_solve True, pause and let user solve in browser.
-    Returns page HTML if successful (no verification after optional manual solve), else None.
-    """
-    with sync_playwright() as p:
-        launch_args = {"headless": False}
-        if proxy:
-            launch_args["proxy"] = {"server": proxy}
-            print(f" Launching Chromium with proxy: {proxy}")
-
-        browser = p.chromium.launch(**launch_args)
+def click_image(image_name, confidence=0.8, timeout=10):
+    print(f" Searching {image_name} (timeout={timeout}s)...")
+    start = time.time()
+    while time.time() - start < timeout:
         try:
-            context = browser.new_context(user_agent=user_agent, viewport={"width": 1280, "height": 800})
+            region = pyautogui.locateOnScreen(image_name, confidence=confidence)
+        except Exception:
+            region = None
+        if region:
+            x, y = pyautogui.center(region)
+            pyautogui.moveTo(x, y, duration=0.4)
+            pyautogui.click()
+            print(f" Clicked {image_name}")
+            return True
+        wait(0.5)
+    print(f" {image_name} not found.")
+    return False
 
-            # Attempt to add cookies if provided
-            if cookies_to_restore:
-                try:
-                    # If cookies were saved from a previous Playwright session they should be compatible
-                    print(" Injecting saved cookies into the browser context...")
-                    context.add_cookies(cookies_to_restore)
-                except Exception as e:
-                    print(f" Could not add cookies: {e}")
+def wait_for_image(image_name, confidence=0.8, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            if pyautogui.locateOnScreen(image_name, confidence=confidence):
+                return True
+        except Exception:
+            pass
+        wait(0.5)
+    return False
 
-            page = context.new_page()
-            page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
+def wait_until_gone(image_name, confidence=0.8, timeout=15):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            region = pyautogui.locateOnScreen(image_name, confidence=confidence)
+        except Exception:
+            region = None
+        if not region:
+            return True
+        wait(0.5)
+    return False
 
-            try:
-                page.goto(url, wait_until="networkidle")
-            except PlaywrightTimeoutError:
-                print(" Navigation timeout; falling back to domcontentloaded.")
-                page.goto(url, wait_until="domcontentloaded")
-
-            # Short pause
-            time.sleep(random.uniform(1.0, 2.5))
-
-            # Detect verification
-            is_verif = detect_human_verification(page)
-            if is_verif:
-                print(" Human verification detected on the page.")
-
-                if allow_manual_solve:
-                    print(" Please solve the verification in the opened browser window.")
-                    print("When done, come back to this console and press ENTER to continue (or type 'skip' to skip this proxy).")
-                    resp = input("Press ENTER when verification is solved (or type 'skip' then ENTER to skip): ").strip().lower()
-                    if resp == "skip":
-                        print("⏭ Skipping this proxy attempt.")
-                        # close browser and try next proxy
-                        try:
-                            context.close()
-                            browser.close()
-                        except Exception:
-                            pass
-                        return None
-                    # user pressed enter to continue — re-check
-                    time.sleep(1.0)
-                    # re-evaluate verification
-                    is_verif = detect_human_verification(page)
-                    if is_verif:
-                        print(" Verification still detected after manual solve attempt.")
-                        try:
-                            context.close()
-                            browser.close()
-                        except Exception:
-                            pass
-                        return None
-                    else:
-                        print(" Verification cleared after manual solve.")
-                else:
-                    print("Skipping proxy because manual solving is not allowed.")
-                    try:
-                        context.close()
-                        browser.close()
-                    except Exception:
-                        pass
-                    return None
-
-            # At this point, no verification is present
-            html = page.content()
-
-            # Save cookies from this verified session
-            try:
-                saved_cookies = context.cookies()
-                if saved_cookies:
-                    save_cookies(saved_cookies, COOKIES_FILE)
-                else:
-                    print(" No cookies were returned from the session.")
-            except Exception as e:
-                print(f" Could not extract cookies: {e}")
-
-            # Clean up
-            context.close()
-            browser.close()
-
-            return html
-
-        finally:
-            # ensure browser closed on exception
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-
-# High-level flow: rotate proxies until success
-
-def main():
-    print("▶ Starting proxy-rotation + cookie-restore flow.")
-
-    # Optional: ask for address (used only by you; you can manually type it into the opened browser)
-    addr = ask_user_for_address()
-    if addr:
-        print(f" Address provided (you can paste/type it into the page): {addr}")
+# ---------------------------
+# READ ADDRESSES
+# ---------------------------
+def read_addresses():
+    print("📂 Enter Excel file path (.xlsx) or Google Sheet link:")
+    src = input("👉 ").strip()
+    if not src:
+        raise ValueError("No file or link provided.")
+    if "docs.google.com" in src:
+        m = re.search(r"/d/([A-Za-z0-9\-_]+)", src)
+        if not m:
+            raise ValueError("Invalid Google Sheet link.")
+        sheet_id = m.group(1)
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+        df = pd.read_excel(url)
     else:
-        print(" No address provided.")
+        if not os.path.exists(src):
+            raise FileNotFoundError("Excel file not found.")
+        df = pd.read_excel(src)
+    if "Store Address" not in df.columns:
+        raise ValueError("Missing 'Store Address' column.")
+    addresses = [str(v).strip() for v in df["Store Address"].dropna()]
+    print(f"✅ Loaded {len(addresses)} addresses.")
+    return addresses
 
-    # Load saved cookies if present and ask user if they want to reuse
-    saved_cookies = load_cookies(COOKIES_FILE)
-    cookies_to_restore = None
-    if saved_cookies:
-        ans = input("Found saved cookies. Reuse them? (y/N): ").strip().lower()
-        if ans == "y":
-            cookies_to_restore = saved_cookies
-            print(" Will try reusing saved cookies for each proxy session.")
+# ---------------------------
+# OPEN DOORDASH
+# ---------------------------
+def open_doordash():
+    print("🧭 Opening DoorDash with your saved Chrome session...")
+    subprocess.Popen([
+        CHROME_PATH,
+        "--remote-debugging-port=9222",
+        f"--user-data-dir={CHROME_PROFILE}",
+        f"--profile-directory={CHROME_PROFILE_NAME}",
+        "--new-window",
+        DOORDASH_URL
+    ])
+    wait(8)
+    try:
+        pyautogui.hotkey("alt", "tab")
+        wait(0.6)
+        pyautogui.hotkey("win", "up")
+    except Exception:
+        pass
+    print("✅ DoorDash window ready (session preserved).")
+
+# ADDRESS FLOW
+def select_first_suggestion():
+    wait(1.2)
+    pyautogui.press("down")
+    wait(0.25)
+    pyautogui.press("enter")
+
+def handle_next_and_save():
+    if click_image("next_button.png", confidence=0.85, timeout=5):
+        wait(1.5)
+    if click_image("save_button.png", confidence=0.85, timeout=6):
+        wait_until_gone("dialog_search.png", confidence=0.8, timeout=15)
+    else:
+        wait_until_gone("dialog_search.png", confidence=0.8, timeout=8)
+
+def change_location(address):
+    print(f" Changing location to: {address}")
+    for attempt in range(3):
+        if click_image("address_box.png", confidence=0.7, timeout=10):
+            wait(1)
+            pyautogui.click()
+            if wait_for_image("dialog_search.png", confidence=0.75, timeout=10):
+                click_image("dialog_search.png", confidence=0.7, timeout=3)
+                type_text_clipboard(address)
+                wait(1)
+                select_first_suggestion()
+                wait(1.5)
+                handle_next_and_save()
+                print("✅ Address changed successfully.")
+                return True
+        wait(2)
+    print(" Could not change address.")
+    return False
+
+# FLOWERS PAGE LOGIC
+# ---------------------------
+def click_browse_all_and_flowers():
+    print(" Navigating to Flowers category...")
+    if click_image("browse_all.png", confidence=0.8, timeout=10):
+        wait(2)
+        if click_image("flowers_btn.png", confidence=0.8, timeout=10):
+            print(" Clicked Flowers successfully!")
+            wait(5)
+            scroll_and_click_arrows("arrow.png", confidence=0.8)
         else:
-            print(" Not reusing saved cookies (will attempt fresh session).")
+            print(" flowers_btn.png not found.")
+    else:
+        print("browse_all.png not found.")
+    wait(2)
+-
+# SCROLL + CLICK ARROWS
+# ---------------------------
+def scroll_and_click_arrows(arrow_image="arrow.png", confidence=0.8, scroll_pause=1.2):
+    print("\n Scrolling Flowers page and clicking arrows...")
+    arrows_clicked = 0
+    not_found = 0
 
-    # Build proxy sequence; ensure at least one attempt without proxy if PROXIES empty
-    proxies_list = PROXIES if PROXIES else [None]
-    proxy_cycle = itertools.cycle(proxies_list)
-    attempts = 0
-    max_attempts = len(proxies_list)
-
-    last_error = None
-    for _ in range(max_attempts):
-        proxy = next(proxy_cycle)
-        attempts += 1
-        print(f"\n--- Attempt {attempts}/{max_attempts}  (proxy={proxy}) ---")
-        ua = random.choice(USER_AGENTS)
+    while True:
         try:
-            html = run_one_session(TARGET_URL, proxy, ua, cookies_to_restore, allow_manual_solve=True)
-            if html:
-                print(" Successfully loaded page without verification blocking.")
-                parse_and_save_html(html, HTML_DUMP)
-                return
-            else:
-                print(" Session did not produce usable HTML (verification unsolved or skipped). Trying next proxy.")
+            region = pyautogui.locateOnScreen(arrow_image, confidence=confidence)
+        except Exception:
+            region = None
+
+        if region:
+            x, y = pyautogui.center(region)
+            pyautogui.moveTo(x, y, duration=0.4)
+            pyautogui.click()
+            arrows_clicked += 1
+            print(f" Clicked arrow #{arrows_clicked}")
+            not_found = 0
+            wait(1.0)
+        else:
+            not_found += 1
+            pyautogui.scroll(-700)
+            wait(scroll_pause)
+            if not_found > 5:
+                print(" No more arrows visible. Doing final deep scrolls...")
+                for _ in range(4):
+                    pyautogui.scroll(-900)
+                    wait(1.0)
+                print(f" Finished all arrows ({arrows_clicked} clicked).")
+                break
+    print(" Finished clicking and scrolling.\n")
+
+
+# SCRAPE LINKS (Playwright)
+# --------------------------
+def scrape_raw_links():
+    print(" Connecting to existing Chrome to scrape links...")
+    with sync_playwright() as p:
+        try:
+            browser = p.chromium.connect_over_cdp("http://localhost:9222")
         except Exception as e:
-            last_error = e
-            print(f" Exception during attempt with proxy {proxy}: {e}")
+            print(f" Playwright connection failed: {e}")
+            return
+        context = browser.contexts[0]
+        page = context.pages[0]
+        print(f" Connected | URL: {page.url}")
+        time.sleep(3)
+        selector = 'div.sc-eqUAAy.hZncWr a'
+        elements = page.query_selector_all(selector)
+        print(f"🔍 Found {len(elements)} links in div.sc-eqUAAy.hZncWr")
+        links = []
+        for i, el in enumerate(elements, start=1):
+            href = el.get_attribute("href")
+            if href:
+                links.append({"Link": href})
+                print(f" [{i}] {href}")
+        if links:
+            df = pd.DataFrame(links)
+            df.to_excel(OUTPUT_FILE, index=False)
+            print(f"\n Saved {len(df)} links to {OUTPUT_FILE}")
+        else:
+            print(" No links found.")
+        browser.close()
+        print(" Scraping done.")
 
-    print(" All attempts exhausted.")
-    if last_error:
-        print("Last exception:", last_error)
+# ---------------------------
+# MAIN
+# ---------------------------
+def main():
+    try:
+        addresses = read_addresses()
+    except Exception as e:
+        print(f" Address file error: {e}")
+        return
 
+    open_doordash()
+    print("\n Starting automation...\n")
+
+    for i, addr in enumerate(addresses, start=1):
+        print(f" [{i}/{len(addresses)}] {addr}")
+        if change_location(addr):
+            click_browse_all_and_flowers()
+        else:
+            print(f" Skipped address {addr}")
+
+    scrape_raw_links()
+    print("\n Completed all tasks successfully!")
+
+# ---------------------------
+# RUN
+# ---------------------------
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except pyautogui.FailSafeException:
+        print(" Manually stopped.")
+    except Exception as ex:
+        print(f"Unexpected error: {ex}")
+
